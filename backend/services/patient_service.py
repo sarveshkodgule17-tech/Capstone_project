@@ -1,0 +1,152 @@
+"""Patient risk assessment — powered by XGBoost ML model.
+Uses ONLY lifestyle factors to provide a patient-friendly screening.
+"""
+from __future__ import annotations
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Tuple, Any, Dict
+
+from schemas.patient import PatientRiskInput
+from database.mongodb import patients_collection
+
+MODELS_DIR = Path(__file__).parent.parent / "models"
+
+# ── Lazy model loading ───────────────────────────────────────────────────────
+_clf_pat: Any = None
+_scaler_pat: Any = None
+
+def _load_patient_models() -> bool:
+    global _clf_pat, _scaler_pat
+    if _clf_pat is not None:
+        return True
+    try:
+        import joblib
+        _clf_pat    = joblib.load(MODELS_DIR / "detection_patient.pkl")
+        _scaler_pat = joblib.load(MODELS_DIR / "scaler_patient.pkl")
+        return True
+    except Exception as e:
+        print(f"[ML-Patient] Load error: {e}")
+        return False
+
+
+def _rule_based(data: PatientRiskInput) -> Tuple[str, str, float, float]:
+    score = 0
+    if data.age < 12:              score += 2
+    if data.screen_time > 4:       score += 2
+    if data.reading_time > 3:      score += 1
+    if data.work_hours > 8:        score += 1
+    if data.sleep_hours < 7:       score += 1
+    if data.outdoor_activity < 2:  score += 2
+    if data.parental_myopia == 1:  score += 2
+    elif data.parental_myopia == 2: score += 4
+    
+    if score >= 7:
+        return "High",   "High lifestyle risk detected. Consult an ophthalmologist.", 0.85, 0.0
+    elif score >= 4:
+        return "Medium", "Moderate lifestyle risk. Increase outdoor activity.", 0.55, 0.0
+    return "Low", "Low lifestyle risk. Maintain healthy vision habits.", 0.20, 0.0
+
+
+def _ml_predict(data: PatientRiskInput) -> Optional[Tuple[str, str, float, float]]:
+    import numpy as np
+    if not _load_patient_models():
+        return None
+        
+    try:
+        # Patient Features: [age, gender_idx, reading, screen, outdoor, sleep, parental]
+        gender_idx = 1.0 if str(data.gender).lower() == "female" else 0.0
+        X = np.array([[
+            float(data.age),
+            gender_idx,
+            float(data.reading_time),
+            float(data.screen_time),
+            float(data.outdoor_activity),
+            float(data.sleep_hours),
+            float(data.parental_myopia)
+        ]])
+
+        X_scaled = _scaler_pat.transform(X)
+        probability = float(_clf_pat.predict_proba(X_scaled)[0][1])
+
+        if probability >= 0.70:
+            risk, rec = "High", "High probability based on lifestyle factors. Clinical exam recommended."
+        elif probability >= 0.40:
+            risk, rec = "Medium", "Moderate risk. Balance screen time with outdoor activities."
+        else:
+            risk, rec = "Low", "Low lifestyle risk. Continue healthy habits."
+
+        return risk, rec, float(round(probability, 4)), 0.0 # Progression is handled on the doctor's side
+
+    except Exception as e:
+        print(f"[ML-Patient] Prediction error: {e}")
+        return None
+
+
+def calculate_risk(data: PatientRiskInput) -> Tuple[str, str, float, float]:
+    result = _ml_predict(data)
+    if result: return result
+    return _rule_based(data)
+
+
+async def assess_patient_risk(user_id: str, data: PatientRiskInput):
+    risk_level, recommendation, probability, next_spheq = calculate_risk(data)
+
+    patient_record = data.model_dump()
+    patient_record["user_id"]              = user_id
+    patient_record["risk_level"]           = risk_level
+    patient_record["recommendation"]       = recommendation
+    patient_record["myopia_probability"]   = probability
+    patient_record["predicted_next_spheq"] = next_spheq
+    patient_record["myopia_detected"]      = probability >= 0.5
+    patient_record["created_at"]           = datetime.now().isoformat()
+    # assigned_doctor_id is already in data.model_dump() from the schema field
+
+    await patients_collection.insert_one(patient_record)
+
+    # ── Send high-risk email alert to assigned doctor (best-effort) ──────────
+    if risk_level == "High" and data.assigned_doctor_id:
+        try:
+            from database.mongodb import users_collection
+            from bson import ObjectId
+            from services.email_service import send_high_risk_alert
+            import asyncio
+            doc = await users_collection.find_one({"_id": ObjectId(data.assigned_doctor_id)})
+            if doc and doc.get("email"):
+                # Fire-and-forget in a thread (smtplib is blocking)
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(
+                    None,
+                    send_high_risk_alert,
+                    doc["email"],
+                    doc.get("name", "Doctor"),
+                    data.name,
+                    data.age,
+                    probability
+                )
+        except Exception as e:
+            print(f"[Email] Alert skipped: {e}")
+
+    return {
+        "risk_level":           risk_level,
+        "recommendation":       recommendation,
+        "myopia_probability":   probability,
+        "myopia_detected":      probability >= 0.5,
+        "predicted_next_spheq": next_spheq,
+    }
+
+
+async def get_patient_history(user_id: str) -> list:
+    """
+    Returns all past screenings for a given patient (by user_id), newest first.
+    Used to display screening history in the Patient Dashboard.
+    """
+    cursor = patients_collection.find(
+        {"user_id": user_id},
+        sort=[("created_at", -1)]
+    )
+    records = await cursor.to_list(length=50)
+    result = []
+    for r in records:
+        r["id"] = str(r.pop("_id", ""))
+        result.append(r)
+    return result

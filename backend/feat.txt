@@ -1,0 +1,2 @@
+DET:['age', 'al', 'acd', 'lt', 'vcd', 'reading_hours', 'screen_time', 'outdoor_activity', 'parental_myopia']
+PROG:['spheq', 'al', 'reading_hours', 'screen_time', 'outdoor_activity', 'parental_myopia']

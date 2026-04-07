@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+motor
+pydantic
+pydantic[email]
+PyJWT
+bcrypt
+python-multipart
+reportlab
+opencv-python-headless
+python-dotenv
+
